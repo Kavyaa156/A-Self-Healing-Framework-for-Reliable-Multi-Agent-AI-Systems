@@ -1,0 +1,17 @@
+# Secrets: never commit these
+.env
+
+# Python
+__pycache__/
+*.pyc
+.venv/
+venv/
+
+# Generated vector stores (rebuilt by seed_validation_store.py)
+chroma_store/
+chroma_store_smoketest/
+
+# Editor / OS
+.vscode/
+.DS_Store
+Thumbs.db
