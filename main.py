@@ -1,24 +1,11 @@
+
 """
-main.py -- Integration entry point (Step 7 / Section 7).
+AgentHeal integration entry point.
 
-Wires the full pipeline end-to-end:
-
-    P1  MultiAgentWorkflow.run_task()          -> RawEvents
-    P2  TelemetryCollector.process_events()    -> ExecutionEvents + ExecutionGraph
-    P3  compute_consistency / compute_semantic_accuracy /
-        compute_execution_rate / compute_reliability -> ReliabilityScore
-    P4  detect_failure() + build_diagnosis()   -> FailureDiagnosis
-
-Two demo scenarios, per the plan:
-    1. Clean run          -- no fault, should NOT be flagged.
-    2. Forced-failure run -- an F2 (execution error) fault is injected,
-       showing the full detect -> diagnose loop end-to-end.
-
-Run with:  python main.py
+Runs one clean scenario and then tests F1, F2, F3 and F4.
 """
 
 import json
-import os
 import uuid
 from typing import List
 
@@ -26,12 +13,6 @@ from schemas.events import TaskSpec, RawEvent
 from agents.workflow import MultiAgentWorkflow
 from tests.fault_injection import run_task_with_fault
 
-# S (semantic accuracy) needs a seeded ValidationStore (Chroma +
-# sentence-transformers). This downloads an embedding model from
-# Hugging Face on first run, so it needs real internet access once.
-# If chromadb/sentence-transformers aren't installed yet, or you're
-# offline, main() falls back to running WITHOUT a validation store
-# (S is stubbed to 1.0) so the rest of the pipeline still runs.
 try:
     from reliability.seed_validation_store import seed_store
     HAS_VALIDATION_STORE_DEPS = True
@@ -39,94 +20,160 @@ except ImportError:
     HAS_VALIDATION_STORE_DEPS = False
 
 
-def save_events_to_jsonl(events: List[RawEvent], filepath: str = "telemetry_events.jsonl"):
-    """Writes raw telemetry events to a JSONL file for debugging/inspection."""
-    with open(filepath, "a", encoding="utf-8") as f:
+def save_events_to_jsonl(
+    events: List[RawEvent],
+    filepath: str = "telemetry_events.jsonl",
+):
+    """Append raw telemetry events to a JSONL file."""
+    with open(filepath, "a", encoding="utf-8") as file:
         for event in events:
-            f.write(json.dumps(event.model_dump()) + "\n")
+            file.write(json.dumps(event.model_dump()) + "\n")
+
     print(f"Saved {len(events)} events to {filepath}")
 
 
 def print_result(label: str, result: dict):
+    """Print reliability scores, detection status and diagnosis."""
     score = result["score"]
+
     print(f"\n--- {label} ---")
-    print(f"  C={score.C:.3f}  S={score.S:.3f}  E={score.E:.3f}  R={score.R:.3f}  (theta={score.threshold})")
-    print(f"  Detected as failure: {result['detected']}")
-    if result["diagnosis"]:
-        d = result["diagnosis"]
-        print(f"  Diagnosis: {d.failure_type} | root cause agent: {d.root_cause_agent}")
-        print(f"  Description: {d.description}")
+    print(
+        f"C={score.C:.3f}  "
+        f"S={score.S:.3f}  "
+        f"E={score.E:.3f}  "
+        f"R={score.R:.3f}  "
+        f"(threshold={score.threshold})"
+    )
+    print(f"Detected as failure: {result['detected']}")
+
+    diagnosis = result["diagnosis"]
+
+    if diagnosis:
+        print(f"Diagnosed fault: {diagnosis.failure_type}")
+        print(f"Root cause agent: {diagnosis.root_cause_agent}")
+        print(f"Description: {diagnosis.description}")
     else:
-        print("  Diagnosis: N/A (no failure detected)")
+        print("Diagnosed fault: None")
+
+
+def create_task(label: str) -> TaskSpec:
+    """Create a separate task for each scenario."""
+    return TaskSpec(
+        task_id=f"task_{label}_{uuid.uuid4().hex[:8]}",
+        description=(
+            "Audit access control policies for unauthorized "
+            "privilege escalation risks"
+        ),
+        initial_input={
+            "target_system": "Authentication Gateway",
+            "log_sample_id": "LOG_2026_08_28",
+        },
+    )
 
 
 def main():
-    print("==========================================================")
-    print(" Self-Healing Multi-Agent Security Framework -- Integration ")
-    print("==========================================================")
+    print("=" * 62)
+    print(" AgentHeal - Multi-Agent Failure Detection and Self-Healing ")
+    print("=" * 62)
 
-    workflow = MultiAgentWorkflow(model_name="openai/gpt-oss-20b", temperature=0.0)
+    workflow = MultiAgentWorkflow(
+        model_name="openai/gpt-oss-20b",
+        temperature=0.0,
+    )
 
-    # Weights: api_orchestration weights (E weight=0.5) are used here
-    # because this project's minimal pipeline puts most of its failure
-    # signal on E (tool_call success/failure). See
-    # reliability/reliability_score.py's DEFAULT_WEIGHTS and
-    # tests/evaluate.py's run_evaluation() docstring for the full
-    # rationale -- swap to whichever weight profile fits your domain.
-    WEIGHTS = (0.2, 0.3, 0.5)
+    # F1 and F3 emphasize semantic accuracy and consistency.
+    # F2 and F4 emphasize execution failures.
+    fault_weights = {
+        "F1": (0.4, 0.4, 0.2),
+        "F2": (0.2, 0.3, 0.5),
+        "F3": (0.4, 0.4, 0.2),
+        "F4": (0.2, 0.3, 0.5),
+    }
+
     THETA = 0.65
+    K = 3
 
     validation_store = None
+
     if HAS_VALIDATION_STORE_DEPS:
         try:
             validation_store = seed_store()
-        except Exception as e:
-            print(f"[!] Could not build/seed validation store ({e}); "
-                  f"continuing with S stubbed to 1.0.")
+        except Exception as error:
+            print(
+                "[WARNING] Could not initialize validation store: "
+                f"{error}"
+            )
     else:
-        print("[!] chromadb / sentence-transformers not installed; "
-              "continuing with S stubbed to 1.0. Run "
-              "`pip install chromadb sentence-transformers` for real S scoring.")
+        print(
+            "[WARNING] chromadb/sentence-transformers are unavailable. "
+            "Semantic accuracy may be stubbed at 1.0, so F1 may not "
+            "be diagnosed correctly."
+        )
 
-    # -----------------------------------------------------------------
+    # ---------------------------------------------------------
     # Scenario 1: Clean run
-    # -----------------------------------------------------------------
-    clean_task = TaskSpec(
-        task_id=f"task_clean_{uuid.uuid4().hex[:8]}",
-        description="Audit access control policies for unauthorized privilege escalation risks",
-        initial_input={
-            "target_system": "Authentication Gateway",
-            "log_sample_id": "LOG_2026_08_28",
-        },
-    )
+    # ---------------------------------------------------------
     clean_result = run_task_with_fault(
-        workflow=workflow, task=clean_task, fault_type=None,
-        k=3, weights=WEIGHTS, theta=THETA, validation_store=validation_store,
+        workflow=workflow,
+        task=create_task("clean"),
+        fault_type=None,
+        k=K,
+        weights=(0.2, 0.3, 0.5),
+        theta=THETA,
+        validation_store=validation_store,
     )
-    save_events_to_jsonl([RawEvent(**e.model_dump()) for e in clean_result["events"]])
-    print_result("SCENARIO 1: Clean run", clean_result)
 
-    # -----------------------------------------------------------------
-    # Scenario 2: Forced failure (F2 -- execution error)
-    # -----------------------------------------------------------------
-    faulty_task = TaskSpec(
-        task_id=f"task_faulty_{uuid.uuid4().hex[:8]}",
-        description="Audit access control policies for unauthorized privilege escalation risks",
-        initial_input={
-            "target_system": "Authentication Gateway",
-            "log_sample_id": "LOG_2026_08_28",
-        },
+    save_events_to_jsonl(
+        [RawEvent(**event.model_dump())
+         for event in clean_result["events"]]
     )
-    faulty_result = run_task_with_fault(
-        workflow=workflow, task=faulty_task, fault_type="F2",
-        k=3, weights=WEIGHTS, theta=THETA, validation_store=validation_store,
-    )
-    save_events_to_jsonl([RawEvent(**e.model_dump()) for e in faulty_result["events"]])
-    print_result("SCENARIO 2: Forced failure (F2 injected)", faulty_result)
+    print_result("CLEAN RUN (no fault injected)", clean_result)
 
-    print("\n==========================================================")
+    # ---------------------------------------------------------
+    # Scenarios 2-5: Test all four fault types
+    # ---------------------------------------------------------
+    print("\n" + "=" * 62)
+    print(" TESTING ALL FOUR FAULT TYPES ")
+    print("=" * 62)
+
+    for fault_type in ("F1", "F2", "F3", "F4"):
+        print(f"\nInjected fault type: {fault_type}")
+
+        result = run_task_with_fault(
+            workflow=workflow,
+            task=create_task(fault_type.lower()),
+            fault_type=fault_type,
+            k=K,
+            weights=fault_weights[fault_type],
+            theta=THETA,
+            validation_store=validation_store,
+            seed=1,
+        )
+
+        save_events_to_jsonl(
+            [RawEvent(**event.model_dump())
+             for event in result["events"]]
+        )
+
+        print_result(f"FAULT TEST: {fault_type}", result)
+
+        diagnosis = result["diagnosis"]
+
+        if not result["detected"]:
+            print("CHECK: Failure was NOT detected.")
+        elif diagnosis is None:
+            print("CHECK: Failure detected, but no diagnosis was produced.")
+        elif diagnosis.failure_type == fault_type:
+            print("CHECK: PASS - diagnosed type matches injected type.")
+        else:
+            print(
+                "CHECK: MISMATCH - injected "
+                f"{fault_type}, diagnosed {diagnosis.failure_type}."
+            )
+
+    print("\n" + "=" * 62)
     print(" Integration run complete.")
-    print("==========================================================")
+    print("=" * 62)
 
 
 if __name__ == "__main__":
